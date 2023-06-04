@@ -46,6 +46,7 @@ class ForecastDataset(torch_data.Dataset):
         self.normalize_method = normalize_method
         self.norm_statistic = norm_statistic
         df = pd.DataFrame(df)
+        # 填充空值，用前一个非空值填充，如果前一个非空值不存在，则替换为后一个非空值
         df = df.fillna(method='ffill', limit=len(df)).fillna(method='bfill', limit=len(df)).values
         self.data = df
         self.df_length = len(df)
@@ -58,8 +59,8 @@ class ForecastDataset(torch_data.Dataset):
         lo = hi - self.window_size
         train_data = self.data[lo: hi]
         target_data = self.data[hi:hi + self.horizon]
-        x = torch.from_numpy(train_data).type(torch.float)
-        y = torch.from_numpy(target_data).type(torch.float)
+        x = torch.from_numpy(train_data).type(torch.float)  # torch.Size([12,140])
+        y = torch.from_numpy(target_data).type(torch.float)  # torch.Size([3,140]), in horizon = 3
         return x, y
 
     def __len__(self):

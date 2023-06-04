@@ -77,20 +77,26 @@ class StockBlockLayer(nn.Module):
 
 class Model(nn.Module):
     def __init__(self, units, stack_cnt, time_step, multi_layer, horizon=1, dropout_rate=0.5, leaky_rate=0.2,
-                 device='cpu'):
+                 device='cuda:0'):
         super(Model, self).__init__()
         self.unit = units
+        # StemGNN Block
         self.stack_cnt = stack_cnt
-        self.unit = units
         self.alpha = leaky_rate
+        # windows size, is the length of the input sequence
         self.time_step = time_step
+        # H predictions in the future, after time t
         self.horizon = horizon
+        # self-attention
+        #  对GRU的最后一个 隐藏状态R 使用self-attention的方式计算邻接矩阵
         self.weight_key = nn.Parameter(torch.zeros(size=(self.unit, 1)))
-        nn.init.xavier_uniform_(self.weight_key.data, gain=1.414)
+        nn.init.xavier_uniform_(self.weight_key.data, gain=1.414)  # 采用xavier_uniform_这种初始化方法
         self.weight_query = nn.Parameter(torch.zeros(size=(self.unit, 1)))
-        nn.init.xavier_uniform_(self.weight_query.data, gain=1.414)
+        nn.init.xavier_uniform_(self.weight_query.data, gain=1.414)  # 采用xavier_uniform_这种初始化方法
+        # nn.GRU parameters: input size, hidden size, num layers=1
+        # args.window _size = self.time step
         self.GRU = nn.GRU(self.time_step, self.unit)
-        self.multi_layer = multi_layer
+        self.multi_layer = multi_layer  # GRU的层数
         self.stock_block = nn.ModuleList()
         self.stock_block.extend(
             [StockBlockLayer(self.time_step, self.unit, self.multi_layer, stack_cnt=i) for i in range(self.stack_cnt)])
@@ -134,26 +140,43 @@ class Model(nn.Module):
         return multi_order_laplacian
 
     def latent_correlation_layer(self, x):
+        # is there has a question ? self.windows
+        # x: (batch, sequence, features)
+        # GRU default input: (sequence, batch, features), default batch_first=False
+        # However， input is (features, batch， sequence) here.
+        # torch.Size([140, 32,12]) sequence(window size)=12, but it equals 140 here
+        # print("_---GRU input shape: "， x.permute(2, , 1).contiguous().shape)
         input, _ = self.GRU(x.permute(2, 0, 1).contiguous())
+        # print("_---GRU output shape:"， input.shape)
+        # last state output shape of GRU in doc: (D * num layers, batch, output _size(self.unit))
+        # However, (sequence, batch, D*Hout(output_size)) when batch first=False here ???
+        # Only all output features is senseful in this situation
+        # torch.Size([140，32，140])
         input = input.permute(1, 0, 2).contiguous()
-        attention = self.self_graph_attention(input)
-        attention = torch.mean(attention, dim=0)
-        degree = torch.sum(attention, dim=1)
+        attention = self.self_graph_attention(input)  # torch.Size([32, 140, 140])
+        attention = torch.mean(attention, dim=0)  # torch.Size([140, 140])
+        degree = torch.sum(attention, dim=1)  # torch.Size([140])
         # laplacian is sym or not
-        attention = 0.5 * (attention + attention.T)
-        degree_l = torch.diag(degree)
+        attention = 0.5 * (attention + attention.T)  # 对称
+        degree_l = torch.diag(degree)  # 返回一个以degree为对角线元素的2D矩阵，torch.size([140，140])
         diagonal_degree_hat = torch.diag(1 / (torch.sqrt(degree) + 1e-7))
         laplacian = torch.matmul(diagonal_degree_hat,
-                                 torch.matmul(degree_l - attention, diagonal_degree_hat))
-        mul_L = self.cheb_polynomial(laplacian)
+                                 torch.matmul(degree_l - attention, diagonal_degree_hat))  # torch.Size([140, 140])
+        mul_L = self.cheb_polynomial(laplacian)  # 多阶拉普拉斯矩阵, torch.Size([140, 140])
         return mul_L, attention
 
     def self_graph_attention(self, input):
+        # input shape here: (batch, sequence, output_size)
         input = input.permute(0, 2, 1).contiguous()
+        #  after trans:(batch, output_size, sequence)
+        #  this is  why input == output ?
         bat, N, fea = input.size()
         key = torch.matmul(input, self.weight_key)
+        #  key shape: torch.Size([32， 140， 1])
         query = torch.matmul(input, self.weight_query)
+        #  torch.repeat 当参数有三个时: (通道数的重复倍数，行的重复倍数，列的重复倍数)
         data = key.repeat(1, 1, N).view(bat, N * N, 1) + query.repeat(1, N, 1)
+        # data shape : torch.size([32，143 *140,1])
         data = data.squeeze(2)
         data = data.view(bat, N, -1)
         data = self.leakyrelu(data)
@@ -166,6 +189,7 @@ class Model(nn.Module):
 
     def forward(self, x):
         mul_L, attention = self.latent_correlation_layer(x)
+        # X: (batch, sequence, features) == > X: (batch, 1， features， sequence)
         X = x.unsqueeze(1).permute(0, 1, 3, 2).contiguous()
         result = []
         for stack_i in range(self.stack_cnt):

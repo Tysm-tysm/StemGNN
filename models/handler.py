@@ -109,6 +109,7 @@ def train(train_data, valid_data, args, result_file):
     if len(valid_data) == 0:
         raise Exception('Cannot organize enough validation data')
 
+    # 对输入数据进行归一化
     if args.norm_method == 'z_score':
         train_mean = np.mean(train_data, axis=0)
         train_std = np.std(train_data, axis=0)
@@ -127,8 +128,10 @@ def train(train_data, valid_data, args, result_file):
         my_optim = torch.optim.RMSprop(params=model.parameters(), lr=args.lr, eps=1e-08)
     else:
         my_optim = torch.optim.Adam(params=model.parameters(), lr=args.lr, betas=(0.9, 0.999))
+    # 按指数衰减调整学习率，调整公式: lr = lr * gamma**epoch
     my_lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer=my_optim, gamma=args.decay_rate)
 
+    # 加载数据
     train_set = ForecastDataset(train_data, window_size=args.window_size, horizon=args.horizon,
                                 normalize_method=args.norm_method, norm_statistic=normalize_statistic)
     valid_set = ForecastDataset(valid_data, window_size=args.window_size, horizon=args.horizon,
@@ -137,6 +140,7 @@ def train(train_data, valid_data, args, result_file):
                                          num_workers=0)
     valid_loader = torch_data.DataLoader(valid_set, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
+    # 实例化损失函数
     forecast_loss = nn.MSELoss(reduction='mean').to(args.device)
 
     total_params = 0
@@ -147,13 +151,14 @@ def train(train_data, valid_data, args, result_file):
     print(f"Total Trainable Params: {total_params}")
 
     best_validate_mae = np.inf
+    # 提前终止计数器
     validate_score_non_decrease_count = 0
     performance_metrics = {}
     for epoch in range(args.epoch):
         epoch_start_time = time.time()
         model.train()
         loss_total = 0
-        cnt = 0
+        cnt = 0  # 最终值为数据总量/batchSize
         for i, (inputs, target) in enumerate(train_loader):
             inputs = inputs.to(args.device)
             target = target.to(args.device)
