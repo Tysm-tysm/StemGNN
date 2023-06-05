@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+# 门控单元paper: Language Modeling with Gated Convolutional Networks
+# 作用:1序列深度建模; 2.减轻梯度弥散，加速收敛
 class GLU(nn.Module):
     def __init__(self, input_channel, output_channel):
         super(GLU, self).__init__()
@@ -28,6 +30,7 @@ class StockBlockLayer(nn.Module):
         self.forecast_result = nn.Linear(self.time_step * self.multi, self.time_step)
         if self.stack_cnt == 0:
             self.backcast = nn.Linear(self.time_step * self.multi, self.time_step)
+        # 数据原特征表达
         self.backcast_short_cut = nn.Linear(self.time_step, self.time_step)
         self.relu = nn.ReLU()
         self.GLUs = nn.ModuleList()
@@ -44,34 +47,73 @@ class StockBlockLayer(nn.Module):
                 self.GLUs.append(GLU(self.time_step * self.output_channel, self.time_step * self.output_channel))
 
     def spe_seq_cell(self, input):
+        # input shape: torch.Size([32, 4, 1, 140, 12])
         batch_size, k, input_channel, node_cnt, time_step = input.size()
         input = input.view(batch_size, -1, node_cnt, time_step)
+
+        # fft: 快速离散傅里叶变换, rfft: 去除那些共扼对称的值，减小存储
         ffted = torch.rfft(input, 1, onesided=False)
+        # ffted shape: torch.Size([32, 4, 140, 12, 2])
         real = ffted[..., 0].permute(0, 2, 1, 3).contiguous().reshape(batch_size, node_cnt, -1)
         img = ffted[..., 1].permute(0, 2, 1, 3).contiguous().reshape(batch_size, node_cnt, -1)
+
+        # GLU
         for i in range(3):
             real = self.GLUs[i * 2](real)
             img = self.GLUs[2 * i + 1](img)
+        # real shape: torch.Size([32，140，240])
+
         real = real.reshape(batch_size, node_cnt, 4, -1).permute(0, 2, 1, 3).contiguous()
         img = img.reshape(batch_size, node_cnt, 4, -1).permute(0, 2, 1, 3).contiguous()
+        # real shape: torch.Size([32, 4, 140, 60])
+
         time_step_as_inner = torch.cat([real.unsqueeze(-1), img.unsqueeze(-1)], dim=-1)
+        #  torch.Size([32, 4, 140, 60, 2])
+
+        # IDFT
         iffted = torch.irfft(time_step_as_inner, 1, onesided=False)
         return iffted
 
     def forward(self, x, mul_L):
-        mul_L = mul_L.unsqueeze(1)
+
+        # x shape: torch.Size([32, 1, 140, 12])
+        # mul L shape: torch.Size([4, 140, 140])
+        mul_L = mul_L.unsqueeze(1)  # torch.Size([4, 1, 140, 140])
         x = x.unsqueeze(1)
+
+        # learning latent representations of multiple time-series in the spectral domain
+        # torch.matmul 支持广播机制
         gfted = torch.matmul(mul_L, x)
+        # gfted shape: torch.Size([32, 4, 1, 10, 12])
+
+        # captures the repeated patterns in the periodic data
+        # or the auto-correlation features among different timestamps
         gconv_input = self.spe_seq_cell(gfted).unsqueeze(2)
+        # gconv_input shape: torch.Size([32, 4, 1, 140, 60])
+
+        # GConV + IGFT
+        # weight: torch.Size([1, 3 + 1, 1, self.time_step * self.multi, self.multi * self.time_step])
+        # weight :[1, 4, 1, 60, 60]
         igfted = torch.matmul(gconv_input, self.weight)
+        # igfted shape : torch.Size([32, 4, 1, 140,  601)
+
         igfted = torch.sum(igfted, dim=1)
+        # igfted shape : torch.Size([32, 1, 140,  601)
+
+        # ----------------- Forecast
         forecast_source = torch.sigmoid(self.forecast(igfted).squeeze(1))
         forecast = self.forecast_result(forecast_source)
+        # forecast_source shape and forecast shape: torch.Size([32, 140, 60]) torch.Size([32, 140, 12])
+
+        # ----------------- Backcast
         if self.stack_cnt == 0:
+            #  x shape: torch.Size([32, 1, 1, 140, 12])
             backcast_short = self.backcast_short_cut(x).squeeze(1)
+            #  backcast_short shape: torch.Size([32, 1, 140, 12])
             backcast_source = torch.sigmoid(self.backcast(igfted) - backcast_short)
         else:
             backcast_source = None
+        # backcast_source shape: torch.Size([32, 1, 140, 12]) or None
         return forecast, backcast_source
 
 
@@ -96,8 +138,8 @@ class Model(nn.Module):
         # nn.GRU parameters: input size, hidden size, num layers=1
         # args.window _size = self.time step
         self.GRU = nn.GRU(self.time_step, self.unit)
-        self.multi_layer = multi_layer  # GRU的层数
-        self.stock_block = nn.ModuleList()
+        self.multi_layer = multi_layer
+        self.stock_block = nn.ModuleList()  # ModuleList block参数将计算在主模型中, 没有顺序要求
         self.stock_block.extend(
             [StockBlockLayer(self.time_step, self.unit, self.multi_layer, stack_cnt=i) for i in range(self.stack_cnt)])
         self.fc = nn.Sequential(
@@ -188,16 +230,27 @@ class Model(nn.Module):
         return torch.matmul(eigenvectors, input)
 
     def forward(self, x):
+        # part 1
         mul_L, attention = self.latent_correlation_layer(x)
         # X: (batch, sequence, features) == > X: (batch, 1， features， sequence)
         X = x.unsqueeze(1).permute(0, 1, 3, 2).contiguous()
+
+        # part 2
         result = []
-        for stack_i in range(self.stack_cnt):
+        for stack_i in range(self.stack_cnt):  # stack_i帮助判断是第几个block，因为两个不同的block有一些区别。
+            # X shape : torch.Size([32, 1, 140, 12])
+            # mul_L shape : torch.Size([4, 140, 140])
             forecast, X = self.stock_block[stack_i](X, mul_L)
+            # output X : backcast = X - X hat ==> torch.Size([32，1，140，12])
             result.append(forecast)
-        forecast = result[0] + result[1]
+
+        forecast = result[0] + result[1]  # torch.Size([32, 140, 12])
+
         forecast = self.fc(forecast)
+
         if forecast.size()[-1] == 1:
+            # forecast shape: torch.Size([32, 140, 1]) ==> torch.Size([32, 1, 140])
             return forecast.unsqueeze(1).squeeze(-1), attention
         else:
+            # forecast shape: torch.Size([32, 140, 3]) ==> torch.Size([32, 3, 140])
             return forecast.permute(0, 2, 1).contiguous(), attention
